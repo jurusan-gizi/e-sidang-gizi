@@ -1,0 +1,811 @@
+/**
+ * e-Sidang Gizi - Google Apps Script Backend
+ * Jurusan Gizi Poltekkes Kemenkes Makassar
+ *
+ * Menangani:
+ * - doGet  : mengambil semua data pengajuan (NIM otomatis disensor sebelum dikirim)
+ *            + data nilai (?type=nilai)
+ * - doPost : create, update, delete, verify (SEMUA PERSIS SEPERTI SEBELUMNYA -- tidak diubah)
+ *            + verifyDosenPin, saveNilai, setStatusKelulusan (BARU, untuk fitur Input Nilai)
+ *
+ * ================================================================
+ * CARA SETUP FITUR NILAI (dilakukan SEKALI oleh admin):
+ * 1. Buka Google Sheet yang jadi database aplikasi ini.
+ * 2. Buat sheet baru bernama persis:  DosenPIN
+ *    Isi kolom: A = dosenName (nama dosen PERSIS sama seperti di DosenList pada HTML)
+ *               B = pin       (PIN bebas, misalnya 4-6 digit, boleh angka/huruf)
+ *    Baris pertama harus header: dosenName | pin
+ * 3. Buat sheet baru bernama persis:  AdminPin
+ *    Isi kolom: A = pin (kode akses admin, bebas -- boleh lebih dari satu baris
+ *               kalau mau kasih kode berbeda untuk beberapa staf/kaprodi)
+ *    Baris pertama harus header: pin
+ *    Kode ini yang dipakai untuk membuka tab "Berita Acara" (rekap nilai +
+ *    NIM lengkap + unduh Excel) -- tab ini TIDAK bisa diakses tanpa kode ini.
+ * 4. Sheet "Nilai", "StatusKelulusan", dan "SuratStatus" akan dibuat OTOMATIS
+ *    oleh script begitu dipakai pertama kali. Tidak perlu dibuat manual.
+ * 5. Buat sheet baru bernama persis:  Mahasiswa
+ *    Isi kolom: A = nim (NIM mahasiswa, PERSIS termasuk huruf besar/kecil)
+ *               B = nama (nama lengkap resmi mahasiswa)
+ *               C = prodi (PERSIS sama seperti nilai Prodi di form pengajuan,
+ *                   mis. "Prodi D3 Gizi")
+ *               D = angkatan (tahun masuk, mis. "2022")
+ *    Baris pertama harus header: nim | nama | prodi | angkatan
+ *    Dipakai untuk: (a) auto-isi nama saat NIM diketik di form pengajuan,
+ *    dan (b) Dashboard Progres Ujian (rekap siapa sudah/belum ujian).
+ *    Endpoint pencarian per-NIM HANYA mengembalikan nama untuk satu NIM yang
+ *    diminta; endpoint dashboard mengirim seluruh daftar TAPI dengan NIM
+ *    selalu disensor -- NIM lengkap tetap tidak pernah bisa diambil massal.
+ * 5. PIN dosen & kode admin TIDAK PERNAH dikirim balik ke browser dalam
+ *    bentuk apapun -- hanya dicocokkan di server, sama seperti pola
+ *    verifikasi NIM mahasiswa. NIM mahasiswa juga SELALU disensor untuk
+ *    semua orang KECUALI lewat endpoint getAdminData setelah kode admin
+ *    terbukti valid.
+ * ================================================================
+ */
+
+var SHEET_HEADERS = [
+  "id", "nama", "nim", "prodi", "kelas", "jenisUjian", "judul",
+  "pembimbing1", "pembimbing2", "penguji1", "tanggal",
+  "slotWaktu", "ruangan", "timestamp"
+];
+
+var NILAI_HEADERS = [
+  "id", "examId", "jenisUjian", "role", "dosenName",
+  "aspekJSON", "skorKomponenJSON", "skorAkhirUtama", "skorAkhirUAP",
+  "timestamp"
+];
+
+var DOSENPIN_HEADERS = ["dosenName", "pin"];
+
+var ADMINPIN_HEADERS = ["pin"];
+
+var MAHASISWA_HEADERS = ["nim", "nama", "prodi", "angkatan"];
+
+var STATUS_HEADERS = ["examId", "statusKelulusan", "kaprodiNama", "kaprodiNip", "kaprodiJabatan", "timestamp"];
+
+var SURAT_HEADERS = ["examId", "status", "timestamp"];
+
+/**
+ * Sensor NIM: tampilkan 6 karakter awal + **** + 3 karakter akhir.
+ * Harus konsisten dengan fungsi maskNim() di sisi HTML/JavaScript.
+ */
+function maskNim_(nim) {
+  var str = String(nim || '');
+  if (str.length <= 8) return str;
+  return str.slice(0, 6) + '****' + str.slice(-3);
+}
+
+/**
+ * Ambil sheet berdasarkan nama; buat otomatis (dengan header) kalau belum ada.
+ * Dipakai untuk sheet-sheet BARU (Nilai, StatusKelulusan) supaya tidak perlu
+ * dibuat manual satu-satu oleh admin.
+ */
+function getOrCreateSheet_(name, headers) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(name);
+  if (!sheet) {
+    sheet = ss.insertSheet(name);
+    sheet.appendRow(headers);
+  } else if (sheet.getLastRow() === 0) {
+    sheet.appendRow(headers);
+  }
+  return sheet;
+}
+
+/**
+ * ============================================================
+ * FUNGSI TES SEMENTARA -- tempel, jalankan lewat tombol "Jalankan" di
+ * editor (pilih fungsi "testVerifyPage" di dropdown sebelah tombol Jalankan),
+ * lalu buka "Log eksekusi" / "Executions". Ini mensimulasikan PERSIS apa
+ * yang terjadi saat QR discan -- kalau ada bug di kode verifikasi, error
+ * aslinya akan tertangkap di sini. Boleh dihapus lagi setelah selesai diagnosa.
+ * ============================================================
+ */
+function testVerifyPage() {
+  // GANTI ID di bawah ini dengan salah satu id Nilai ASLI dari sheet "Nilai"
+  // Anda (kolom "id", contohnya seperti 1234567890123_pembimbing1) -- atau
+  // biarkan seperti ini dulu untuk menguji kasus "data tidak ditemukan".
+  var contohId = 'contoh-tes-123_pembimbing1';
+
+  var fakeEvent = { parameter: { verify: contohId } };
+  var result = doGet(fakeEvent);
+  Logger.log('BERHASIL, tidak ada error. Isi halaman:');
+  Logger.log(result.getContent());
+}
+
+/**
+ * Mengambil semua data pengajuan dari Sheet dan mengembalikannya sebagai JSON.
+ * NIM SELALU disensor di sini sebelum dikirim -- ini mencegah NIM lengkap
+ * bocor walau endpoint ini dipanggil langsung (bukan lewat form di website).
+ *
+ * TIDAK DIUBAH dari versi sebelumnya.
+ */
+function doGet(e) {
+  // Halaman verifikasi (dibuka lewat scan QR code di Berita Acara) --
+  // mengembalikan HTML biasa untuk dibaca manusia, BUKAN JSON.
+  if (e && e.parameter && e.parameter.verify) {
+    return handleVerifyPage_(e.parameter.verify);
+  }
+
+  var type = (e && e.parameter && e.parameter.type) ? e.parameter.type : 'submissions';
+
+  if (type === 'nilai') {
+    return doGetNilai_();
+  }
+
+  if (type === 'mahasiswa-dashboard') {
+    return doGetMahasiswaDashboard_();
+  }
+
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+  var data = sheet.getDataRange().getValues();
+
+  if (data.length < 2) {
+    return ContentService.createTextOutput(JSON.stringify([]))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+
+  var headers = data[0];
+  var result = [];
+
+  for (var i = 1; i < data.length; i++) {
+    var row = {};
+    for (var j = 0; j < headers.length; j++) {
+      var value = data[i][j];
+
+      if (headers[j] === "tanggal" && Object.prototype.toString.call(value) === "[object Date]") {
+        value = Utilities.formatDate(value, Session.getScriptTimeZone(), "yyyy-MM-dd");
+      }
+
+      // NIM disensor di sini -- NIM asli tidak pernah keluar dari server lewat doGet
+      if (headers[j] === "nim") {
+        value = maskNim_(value);
+      }
+
+      row[headers[j]] = value;
+    }
+    result.push(row);
+  }
+
+  return ContentService.createTextOutput(JSON.stringify(result))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+/**
+ * BARU: kirim seluruh data Nilai (skor per aspek + skor akhir), StatusKelulusan,
+ * dan status Surat Ujian ke client, digabung jadi satu objek supaya cukup 1 kali
+ * request. Tidak satupun dari ketiga sheet ini berisi NIM, jadi tidak perlu sensor
+ * -- boleh diakses publik (dipakai juga untuk badge status di tab Jadwal Terjadwal).
+ */
+function doGetNilai_() {
+  var nilaiSheet = getOrCreateSheet_('Nilai', NILAI_HEADERS);
+  var statusSheet = getOrCreateSheet_('StatusKelulusan', STATUS_HEADERS);
+  var suratSheet = getOrCreateSheet_('SuratStatus', SURAT_HEADERS);
+
+  var nilaiResult = sheetToObjects_(nilaiSheet);
+  var statusResult = sheetToObjects_(statusSheet);
+  var suratResult = sheetToObjects_(suratSheet);
+
+  return ContentService.createTextOutput(JSON.stringify({ nilai: nilaiResult, status: statusResult, surat: suratResult }))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+/**
+ * Helper: ubah seluruh isi sebuah sheet jadi array of object berdasarkan header baris pertama.
+ */
+function sheetToObjects_(sheet) {
+  var data = sheet.getDataRange().getValues();
+  var result = [];
+  if (data.length > 1) {
+    var headers = data[0];
+    for (var i = 1; i < data.length; i++) {
+      var row = {};
+      for (var j = 0; j < headers.length; j++) {
+        row[headers[j]] = data[i][j];
+      }
+      result.push(row);
+    }
+  }
+  return result;
+}
+
+/**
+ * BARU: kirim SELURUH daftar mahasiswa (dari sheet "Mahasiswa") untuk
+ * Dashboard Progres Ujian -- dipakai admin maupun dosen, jadi TIDAK perlu
+ * login. NIM SELALU disensor di sini, sama seperti doGet() untuk submission
+ * -- daftar NIM lengkap semua mahasiswa tetap tidak pernah bisa diambil
+ * massal lewat endpoint publik manapun.
+ */
+function doGetMahasiswaDashboard_() {
+  var sheet = getOrCreateSheet_('Mahasiswa', MAHASISWA_HEADERS);
+  var data = sheet.getDataRange().getValues();
+  var result = [];
+
+  if (data.length > 1) {
+    var headers = data[0];
+    for (var i = 1; i < data.length; i++) {
+      var row = {};
+      for (var j = 0; j < headers.length; j++) {
+        var value = data[i][j];
+        if (headers[j] === 'nim') value = maskNim_(value);
+        row[headers[j]] = value;
+      }
+      result.push(row);
+    }
+  }
+
+  return ContentService.createTextOutput(JSON.stringify(result))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+/**
+ * BARU: halaman verifikasi yang terbuka saat seseorang scan QR code di
+ * kolom "TANDA TANGAN" pada Berita Acara. QR menyimpan link ke endpoint ini
+ * dengan ?verify=<id nilai> (untuk dosen) atau ?verify=<examId>_kaprodi
+ * (untuk persetujuan Kaprodi). Menampilkan bukti bahwa dosen/kaprodi tsb
+ * memang sudah menginput nilai / menyetujui lewat sistem -- BUKAN pengganti
+ * tanda tangan basah untuk keperluan hukum/resmi, hanya jejak verifikasi
+ * elektronik. NIM mahasiswa tetap disensor di halaman ini karena bisa
+ * diakses siapa saja yang men-scan QR dari dokumen fisik/PDF manapun.
+ */
+function handleVerifyPage_(verifyId) {
+  var idStr = String(verifyId);
+  var kaprodiSuffix = '_kaprodi';
+  if (idStr.length > kaprodiSuffix.length && idStr.slice(-kaprodiSuffix.length) === kaprodiSuffix) {
+    return handleVerifyKaprodiPage_(idStr.slice(0, -kaprodiSuffix.length));
+  }
+  return handleVerifyNilaiPage_(idStr);
+}
+
+function handleVerifyNilaiPage_(nilaiId) {
+  var nilaiSheet = getOrCreateSheet_('Nilai', NILAI_HEADERS);
+  var data2 = nilaiSheet.getDataRange().getValues();
+  var record = null;
+
+  if (data2.length > 1) {
+    var nHeaders = data2[0];
+    for (var i2 = 1; i2 < data2.length; i2++) {
+      if (String(data2[i2][0]) === String(nilaiId)) {
+        record = {};
+        for (var j2 = 0; j2 < nHeaders.length; j2++) record[nHeaders[j2]] = data2[i2][j2];
+        break;
+      }
+    }
+  }
+
+  if (!record) {
+    return HtmlService.createHtmlOutput(
+      '<html><head><meta name="viewport" content="width=device-width, initial-scale=1"></head>' +
+      '<body style="font-family:Arial,sans-serif; text-align:center; padding:60px 20px; color:#1e293b;">' +
+      '<div style="font-size:48px;">&#10060;</div>' +
+      '<h2 style="color:#e11d48; margin:12px 0 4px 0;">Data Tidak Ditemukan</h2>' +
+      '<p style="color:#64748b; font-size:14px;">Kode verifikasi tidak valid, atau data sudah tidak tersedia di sistem.</p>' +
+      '</body></html>'
+    ).setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+  }
+
+  // Ambil info ujian terkait (nama mahasiswa, jenis ujian) dari sheet submission utama.
+  // NIM SENGAJA tetap disensor di halaman ini.
+  var subSheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+  var subData = subSheet.getDataRange().getValues();
+  var examInfo = null;
+  if (subData.length > 1) {
+    var subHeaders = subData[0];
+    for (var k = 1; k < subData.length; k++) {
+      if (String(subData[k][0]) === String(record.examId)) {
+        examInfo = {};
+        for (var m = 0; m < subHeaders.length; m++) examInfo[subHeaders[m]] = subData[k][m];
+        break;
+      }
+    }
+  }
+
+  var roleLabelMap = {
+    pembimbing1: 'Pembimbing 1 / Ketua Penguji',
+    pembimbing2: 'Pembimbing 2 / Anggota Penguji 1',
+    penguji1: 'Penguji / Anggota Penguji 2'
+  };
+  var namaMahasiswa = examInfo ? examInfo.nama : '-';
+  var nimMasked = examInfo ? maskNim_(examInfo.nim) : '-';
+  var jenisUjian = examInfo ? examInfo.jenisUjian : '-';
+  var skorText = record.skorAkhirUtama +
+    (record.skorAkhirUAP ? ' (Ujian Utama) &bull; ' + record.skorAkhirUAP + ' (UAP)' : '');
+
+  var html =
+    '<html><head><meta name="viewport" content="width=device-width, initial-scale=1">' +
+    '<title>Verifikasi Nilai - e-Sidang Gizi</title></head>' +
+    '<body style="font-family:Arial,sans-serif; max-width:480px; margin:24px auto; padding:0 16px; color:#1e293b;">' +
+    '<div style="text-align:center; margin-bottom:20px;">' +
+      '<div style="width:56px;height:56px;border-radius:50%;background:#d1fae5;color:#059669;display:inline-flex;align-items:center;justify-content:center;font-size:28px;">&#10003;</div>' +
+      '<h2 style="margin:12px 0 4px 0; color:#059669;">Data Terverifikasi</h2>' +
+      '<p style="color:#64748b; font-size:13px; margin:0;">Sistem e-Sidang Gizi &mdash; Jurusan Gizi Poltekkes Kemenkes Makassar</p>' +
+    '</div>' +
+    '<div style="background:#f8fafc; border:1px solid #e2e8f0; border-radius:12px; padding:16px; font-size:14px; line-height:1.9;">' +
+      '<div><strong>Dosen:</strong> ' + record.dosenName + '</div>' +
+      '<div><strong>Peran:</strong> ' + (roleLabelMap[record.role] || record.role) + '</div>' +
+      '<div><strong>Mahasiswa:</strong> ' + namaMahasiswa + ' (' + nimMasked + ')</div>' +
+      '<div><strong>Jenis Ujian:</strong> ' + jenisUjian + '</div>' +
+      '<div><strong>Skor Akhir:</strong> ' + skorText + '</div>' +
+      '<div><strong>Waktu Input Nilai:</strong> ' + record.timestamp + '</div>' +
+    '</div>' +
+    '<p style="text-align:center; color:#94a3b8; font-size:11px; margin-top:20px; line-height:1.6;">' +
+      'Halaman ini dibuat otomatis sebagai bukti elektronik bahwa nilai telah diinput oleh dosen yang ' +
+      'bersangkutan (terautentikasi PIN) melalui sistem e-Sidang Gizi, dan bukan pengganti tanda tangan ' +
+      'basah untuk keperluan hukum/administratif resmi.' +
+    '</p>' +
+    '</body></html>';
+
+  return HtmlService.createHtmlOutput(html)
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+/**
+ * Menangani create / update / delete / verify (submission) -- TIDAK DIUBAH --
+ * ditambah verifyDosenPin / saveNilai / setStatusKelulusan (BARU).
+ */
+function doPost(e) {
+  var contents = JSON.parse(e.postData.contents);
+
+  // --- Action BARU: tidak menyentuh sheet submission sama sekali ---
+  if (contents.action === 'verifyDosenPin') {
+    return handleVerifyDosenPin_(contents);
+  } else if (contents.action === 'saveNilai') {
+    return handleSaveNilai_(contents);
+  } else if (contents.action === 'setStatusKelulusan') {
+    return handleSetStatusKelulusan_(contents);
+  } else if (contents.action === 'markSuratStatus') {
+    return handleMarkSuratStatus_(contents);
+  } else if (contents.action === 'lookupMahasiswa') {
+    return handleLookupMahasiswa_(contents);
+  } else if (contents.action === 'getAdminData') {
+    return handleGetAdminData_(contents);
+  } else if (contents.action === 'deleteExamData') {
+    return handleDeleteExamData_(contents);
+  }
+
+  // --- Action LAMA, PERSIS SEPERTI SEBELUMNYA ---
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+
+  if (contents.action === 'create') {
+    var sub = contents.data;
+
+    if (sheet.getLastRow() === 0) {
+      sheet.appendRow(SHEET_HEADERS);
+    }
+
+    sheet.appendRow([
+      sub.id, sub.nama, sub.nim, sub.prodi, sub.kelas, sub.jenisUjian, sub.judul,
+      sub.pembimbing1, sub.pembimbing2, sub.penguji1, sub.tanggal,
+      sub.slotWaktu, sub.ruangan, sub.timestamp
+    ]);
+
+    return ContentService.createTextOutput(JSON.stringify({ status: 'success' }))
+      .setMimeType(ContentService.MimeType.JSON);
+
+  } else if (contents.action === 'update') {
+    var subUpdate = contents.data;
+    var dataUpdate = sheet.getDataRange().getValues();
+
+    for (var i = 1; i < dataUpdate.length; i++) {
+      if (dataUpdate[i][0] == subUpdate.id) {
+        // PENTING: kolom NIM (index 2) SENGAJA TIDAK diambil dari data yang
+        // dikirim client -- karena client hanya punya versi tersensor.
+        // NIM asli yang sudah ada di baris ini dipertahankan apa adanya.
+        var nimAsli = dataUpdate[i][2];
+
+        sheet.getRange(i + 1, 1, 1, 14).setValues([[
+          subUpdate.id, subUpdate.nama, nimAsli, subUpdate.prodi, subUpdate.kelas, subUpdate.jenisUjian, subUpdate.judul,
+          subUpdate.pembimbing1, subUpdate.pembimbing2, subUpdate.penguji1, subUpdate.tanggal,
+          subUpdate.slotWaktu, subUpdate.ruangan, subUpdate.timestamp
+        ]]);
+        break;
+      }
+    }
+
+    return ContentService.createTextOutput(JSON.stringify({ status: 'success' }))
+      .setMimeType(ContentService.MimeType.JSON);
+
+  } else if (contents.action === 'delete') {
+    var dataDelete = sheet.getDataRange().getValues();
+
+    for (var i = 1; i < dataDelete.length; i++) {
+      if (dataDelete[i][0] == contents.id) {
+        sheet.deleteRow(i + 1);
+        break;
+      }
+    }
+
+    return ContentService.createTextOutput(JSON.stringify({ status: 'success' }))
+      .setMimeType(ContentService.MimeType.JSON);
+
+  } else if (contents.action === 'verify') {
+    // Verifikasi NIM dilakukan DI SINI, di server. Browser hanya kirim NIM
+    // yang diketik mahasiswa + id data, dan HANYA menerima jawaban true/false.
+    // NIM asli tidak pernah ikut dikirim balik ke browser.
+    var dataVerify = sheet.getDataRange().getValues();
+    var isValid = false;
+    var inputNim = String(contents.nim || '').trim().toLowerCase();
+
+    for (var k = 1; k < dataVerify.length; k++) {
+      if (dataVerify[k][0] == contents.id) {
+        var actualNim = String(dataVerify[k][2] || '').trim().toLowerCase();
+        isValid = (actualNim === inputNim && inputNim !== '');
+        break;
+      }
+    }
+
+    return ContentService.createTextOutput(JSON.stringify({ valid: isValid }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+
+  return ContentService.createTextOutput(JSON.stringify({ status: 'error', message: 'Unknown action' }))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+/**
+ * BARU: verifikasi nama dosen + PIN terhadap sheet "DosenPIN".
+ * PIN asli TIDAK PERNAH dikirim balik ke browser -- hanya true/false,
+ * persis pola yang sama dengan verifikasi NIM mahasiswa.
+ */
+function handleVerifyDosenPin_(contents) {
+  var sheet = getOrCreateSheet_('DosenPIN', DOSENPIN_HEADERS);
+  var data = sheet.getDataRange().getValues();
+
+  var inputName = String(contents.dosenName || '').trim().toLowerCase();
+  var inputPin = String(contents.pin || '').trim();
+  var isValid = false;
+
+  for (var i = 1; i < data.length; i++) {
+    var rowName = String(data[i][0] || '').trim().toLowerCase();
+    var rowPin = String(data[i][1] || '').trim();
+    if (rowName === inputName && inputPin !== '' && rowPin === inputPin) {
+      isValid = true;
+      break;
+    }
+  }
+
+  return ContentService.createTextOutput(JSON.stringify({ valid: isValid }))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+/**
+ * BARU: simpan / perbarui nilai satu penilai untuk satu ujian.
+ * "id" nilai dibentuk sebagai examId + "_" + role, sehingga menyimpan ulang
+ * (misalnya dosen mengedit nilai yang sudah diisi sebelumnya) otomatis
+ * menimpa baris lama, bukan menambah baris baru/duplikat.
+ */
+function handleSaveNilai_(contents) {
+  var sheet = getOrCreateSheet_('Nilai', NILAI_HEADERS);
+  var d = contents.data;
+  var nilaiId = String(d.examId) + '_' + d.role;
+
+  var data = sheet.getDataRange().getValues();
+  var rowIndex = -1;
+  for (var i = 1; i < data.length; i++) {
+    if (String(data[i][0]) === nilaiId) {
+      rowIndex = i + 1; // 1-based row number in sheet
+      break;
+    }
+  }
+
+  var rowValues = [
+    nilaiId, d.examId, d.jenisUjian, d.role, d.dosenName,
+    JSON.stringify(d.aspek || {}),
+    JSON.stringify(d.skorKomponen || {}),
+    d.skorAkhirUtama != null ? d.skorAkhirUtama : '',
+    d.skorAkhirUAP != null ? d.skorAkhirUAP : '',
+    new Date().toLocaleString('id-ID')
+  ];
+
+  if (rowIndex > 0) {
+    sheet.getRange(rowIndex, 1, 1, rowValues.length).setValues([rowValues]);
+  } else {
+    sheet.appendRow(rowValues);
+  }
+
+  return ContentService.createTextOutput(JSON.stringify({ status: 'success' }))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+/**
+ * BARU: simpan status kelulusan (Lulus / Lulus Bersyarat / Tidak Lulus) UNTUK
+ * satu ujian, sekaligus data Kaprodi (nama/NIP/jabatan) yang dipilih admin saat
+ * itu -- momen inilah yang dianggap "persetujuan Kaprodi" secara elektronik,
+ * dipakai untuk membuat QR verifikasi di kolom tanda tangan Kaprodi.
+ */
+function handleSetStatusKelulusan_(contents) {
+  var sheet = getOrCreateSheet_('StatusKelulusan', STATUS_HEADERS);
+  var examId = String(contents.examId);
+  var status = contents.status;
+  var kaprodiNama = contents.kaprodiNama || '';
+  var kaprodiNip = contents.kaprodiNip || '';
+  var kaprodiJabatan = contents.kaprodiJabatan || '';
+
+  var data = sheet.getDataRange().getValues();
+  var rowIndex = -1;
+  for (var i = 1; i < data.length; i++) {
+    if (String(data[i][0]) === examId) {
+      rowIndex = i + 1;
+      break;
+    }
+  }
+
+  var rowValues = [examId, status, kaprodiNama, kaprodiNip, kaprodiJabatan, new Date().toLocaleString('id-ID')];
+
+  if (rowIndex > 0) {
+    sheet.getRange(rowIndex, 1, 1, rowValues.length).setValues([rowValues]);
+  } else {
+    sheet.appendRow(rowValues);
+  }
+
+  return ContentService.createTextOutput(JSON.stringify({ status: 'success' }))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+/**
+ * BARU: tandai/batalkan status "Surat Ujian sudah diproses admin" untuk satu
+ * ujian. Dipakai supaya mahasiswa bisa lihat badge status di tab "Jadwal
+ * Terjadwal" tanpa perlu login apapun -- sheet ini TIDAK berisi NIM sama sekali.
+ */
+function handleMarkSuratStatus_(contents) {
+  var sheet = getOrCreateSheet_('SuratStatus', SURAT_HEADERS);
+  var examId = String(contents.examId);
+  var status = contents.status; // 'DIPROSES' untuk menandai, '' untuk membatalkan
+
+  var data = sheet.getDataRange().getValues();
+  var rowIndex = -1;
+  for (var i = 1; i < data.length; i++) {
+    if (String(data[i][0]) === examId) {
+      rowIndex = i + 1;
+      break;
+    }
+  }
+
+  var rowValues = [examId, status, new Date().toLocaleString('id-ID')];
+
+  if (rowIndex > 0) {
+    sheet.getRange(rowIndex, 1, 1, rowValues.length).setValues([rowValues]);
+  } else {
+    sheet.appendRow(rowValues);
+  }
+
+  return ContentService.createTextOutput(JSON.stringify({ status: 'success' }))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+/**
+ * BARU: cari nama mahasiswa berdasarkan NIM di sheet "Mahasiswa" (database
+ * referensi nama resmi, diisi admin). Dipakai supaya mahasiswa tinggal ketik
+ * NIM dan nama otomatis terisi -- mencegah salah ketik nama sendiri.
+ * Hanya mengembalikan nama untuk SATU NIM yang diminta -- TIDAK PERNAH
+ * mengirim seluruh daftar mahasiswa ke browser, supaya data NIM+nama
+ * mahasiswa lain tidak bisa diambil massal oleh siapa pun yang membuka
+ * halaman ini.
+ */
+function handleLookupMahasiswa_(contents) {
+  var sheet = getOrCreateSheet_('Mahasiswa', MAHASISWA_HEADERS);
+  var data = sheet.getDataRange().getValues();
+  var inputNim = String(contents.nim || '').trim();
+  var found = false;
+  var nama = '';
+
+  for (var i = 1; i < data.length; i++) {
+    // replace(/^'/, '') jaga-jaga kalau tanda kutip format-teks ('PO...) di
+    // Google Sheets ikut kebawa sebagai karakter literal (biasanya tidak --
+    // itu cuma penanda format, bukan bagian isi sel -- tapi ini jaring pengaman
+    // kalau datanya berasal dari import/paste sumber lain).
+    var rowNim = String(data[i][0] || '').trim().replace(/^'/, '');
+    if (rowNim === inputNim) {
+      found = true;
+      nama = data[i][1];
+      break;
+    }
+  }
+
+  return ContentService.createTextOutput(JSON.stringify({ found: found, nama: nama }))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+/**
+ * BARU: halaman verifikasi khusus persetujuan Kaprodi (bukan nilai dosen).
+ * Sumbernya sheet "StatusKelulusan", momen "disetujui" dianggap terjadi saat
+ * admin (dengan kode akses admin) memilih Status Kelulusan / mengunduh PDF
+ * Berita Acara -- lihat handleSetStatusKelulusan_. Hanya berlaku untuk
+ * dokumen administrasi internal, BUKAN pengganti tanda tangan basah resmi.
+ */
+function handleVerifyKaprodiPage_(examId) {
+  var statusSheet = getOrCreateSheet_('StatusKelulusan', STATUS_HEADERS);
+  var data = statusSheet.getDataRange().getValues();
+  var record = null;
+
+  if (data.length > 1) {
+    var headers = data[0];
+    for (var i = 1; i < data.length; i++) {
+      if (String(data[i][0]) === String(examId)) {
+        record = {};
+        for (var j = 0; j < headers.length; j++) record[headers[j]] = data[i][j];
+        break;
+      }
+    }
+  }
+
+  if (!record || !record.kaprodiNama) {
+    return HtmlService.createHtmlOutput(
+      '<html><head><meta name="viewport" content="width=device-width, initial-scale=1"></head>' +
+      '<body style="font-family:Arial,sans-serif; text-align:center; padding:60px 20px; color:#1e293b;">' +
+      '<div style="font-size:48px;">&#10060;</div>' +
+      '<h2 style="color:#e11d48; margin:12px 0 4px 0;">Data Tidak Ditemukan</h2>' +
+      '<p style="color:#64748b; font-size:14px;">Persetujuan Ketua Program Studi untuk dokumen ini belum tercatat di sistem.</p>' +
+      '</body></html>'
+    ).setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+  }
+
+  var subSheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+  var subData = subSheet.getDataRange().getValues();
+  var examInfo = null;
+  if (subData.length > 1) {
+    var subHeaders = subData[0];
+    for (var k = 1; k < subData.length; k++) {
+      if (String(subData[k][0]) === String(examId)) {
+        examInfo = {};
+        for (var m = 0; m < subHeaders.length; m++) examInfo[subHeaders[m]] = subData[k][m];
+        break;
+      }
+    }
+  }
+
+  var namaMahasiswa = examInfo ? examInfo.nama : '-';
+  var nimMasked = examInfo ? maskNim_(examInfo.nim) : '-';
+  var jenisUjian = examInfo ? examInfo.jenisUjian : '-';
+
+  var html =
+    '<html><head><meta name="viewport" content="width=device-width, initial-scale=1">' +
+    '<title>Verifikasi Persetujuan - e-Sidang Gizi</title></head>' +
+    '<body style="font-family:Arial,sans-serif; max-width:480px; margin:24px auto; padding:0 16px; color:#1e293b;">' +
+    '<div style="text-align:center; margin-bottom:20px;">' +
+      '<div style="width:56px;height:56px;border-radius:50%;background:#d1fae5;color:#059669;display:inline-flex;align-items:center;justify-content:center;font-size:28px;">&#10003;</div>' +
+      '<h2 style="margin:12px 0 4px 0; color:#059669;">Persetujuan Terverifikasi</h2>' +
+      '<p style="color:#64748b; font-size:13px; margin:0;">Sistem e-Sidang Gizi &mdash; Jurusan Gizi Poltekkes Kemenkes Makassar</p>' +
+    '</div>' +
+    '<div style="background:#f8fafc; border:1px solid #e2e8f0; border-radius:12px; padding:16px; font-size:14px; line-height:1.9;">' +
+      '<div><strong>Disetujui oleh:</strong> ' + record.kaprodiNama + '</div>' +
+      '<div><strong>Jabatan:</strong> ' + (record.kaprodiJabatan || '-') + '</div>' +
+      '<div><strong>Mahasiswa:</strong> ' + namaMahasiswa + ' (' + nimMasked + ')</div>' +
+      '<div><strong>Jenis Ujian:</strong> ' + jenisUjian + '</div>' +
+      '<div><strong>Keputusan:</strong> ' + record.statusKelulusan + '</div>' +
+      '<div><strong>Waktu Persetujuan:</strong> ' + record.timestamp + '</div>' +
+    '</div>' +
+    '<p style="text-align:center; color:#94a3b8; font-size:11px; margin-top:20px; line-height:1.6;">' +
+      'Halaman ini dibuat otomatis sebagai bukti elektronik persetujuan Ketua Program Studi lewat sistem ' +
+      'e-Sidang Gizi, khusus untuk keperluan administrasi internal tugas akhir -- bukan pengganti tanda ' +
+      'tangan basah untuk keperluan hukum/administratif resmi lainnya.' +
+    '</p>' +
+    '</body></html>';
+
+  return HtmlService.createHtmlOutput(html)
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+/**
+ * BARU: cocokkan kode akses admin terhadap sheet "AdminPin".
+ * Sheet ini boleh diisi lebih dari satu baris kalau ingin memberi kode
+ * berbeda untuk beberapa staf -- semuanya dianggap valid selama cocok.
+ */
+function isAdminPinValid_(pin) {
+  var sheet = getOrCreateSheet_('AdminPin', ADMINPIN_HEADERS);
+  var data = sheet.getDataRange().getValues();
+  var inputPin = String(pin || '').trim();
+  if (inputPin === '') return false;
+
+  for (var i = 1; i < data.length; i++) {
+    if (String(data[i][0] || '').trim() === inputPin) return true;
+  }
+  return false;
+}
+
+/**
+ * BARU: endpoint KHUSUS ADMIN. Memverifikasi kode akses admin, dan HANYA
+ * jika valid, mengembalikan seluruh data pengajuan DENGAN NIM LENGKAP
+ * (tidak disensor) -- dipakai untuk Berita Acara & rekap Excel.
+ * Kalau kode salah, tidak ada data submission yang ikut terkirim sama sekali.
+ */
+function handleGetAdminData_(contents) {
+  if (!isAdminPinValid_(contents.pin)) {
+    return ContentService.createTextOutput(JSON.stringify({ valid: false }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+  var data = sheet.getDataRange().getValues();
+  var result = [];
+
+  if (data.length >= 2) {
+    var headers = data[0];
+    for (var i = 1; i < data.length; i++) {
+      var row = {};
+      for (var j = 0; j < headers.length; j++) {
+        var value = data[i][j];
+        if (headers[j] === "tanggal" && Object.prototype.toString.call(value) === "[object Date]") {
+          value = Utilities.formatDate(value, Session.getScriptTimeZone(), "yyyy-MM-dd");
+        }
+        // TIDAK disensor di sini -- endpoint ini hanya bisa dicapai
+        // setelah kode akses admin terbukti valid di baris atas.
+        row[headers[j]] = value;
+      }
+      result.push(row);
+    }
+  }
+
+  return ContentService.createTextOutput(JSON.stringify({ valid: true, submissions: result }))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+/**
+ * BARU: hapus SEMUA baris pada sebuah sheet yang nilai kolomnya (dicari lewat
+ * nama header) cocok dengan `value`. Dihapus dari baris paling BAWAH ke ATAS
+ * supaya index baris yang belum diproses tidak bergeser.
+ */
+function deleteRowsByColumn_(sheet, columnName, value) {
+  if (!sheet) return 0;
+  var data = sheet.getDataRange().getValues();
+  if (data.length < 2) return 0;
+
+  var headers = data[0];
+  var colIndex = headers.indexOf(columnName);
+  if (colIndex === -1) return 0;
+
+  var target = String(value);
+  var deletedCount = 0;
+
+  for (var i = data.length - 1; i >= 1; i--) {
+    if (String(data[i][colIndex]) === target) {
+      sheet.deleteRow(i + 1);
+      deletedCount++;
+    }
+  }
+  return deletedCount;
+}
+
+/**
+ * BARU: endpoint KHUSUS ADMIN untuk menghapus SATU data ujian secara
+ * menyeluruh (cascading delete) -- dipakai oleh menu "Hapus" di tab
+ * Berita Acara. Kode akses admin diverifikasi ULANG di sini di server
+ * (tidak pernah percaya begitu saja pada tombol di browser), persis pola
+ * yang sama dengan handleGetAdminData_.
+ *
+ * Menghapus:
+ * 1. Baris pengajuan (sheet utama, dicocokkan lewat kolom "id")
+ * 2. Semua baris nilai terkait (sheet "Nilai", dicocokkan lewat "examId")
+ * 3. Baris status kelulusan terkait (sheet "StatusKelulusan", lewat "examId")
+ * 4. Baris status surat terkait (sheet "SuratStatus", lewat "examId")
+ */
+function handleDeleteExamData_(contents) {
+  if (!isAdminPinValid_(contents.pin)) {
+    return ContentService.createTextOutput(JSON.stringify({ status: 'error', message: 'Kode akses admin salah.' }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+
+  var examId = contents.examId;
+  if (!examId) {
+    return ContentService.createTextOutput(JSON.stringify({ status: 'error', message: 'examId tidak ada.' }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+
+  // 1. Hapus baris pengajuan dari sheet utama (kolom "id")
+  var mainSheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+  var mainData = mainSheet.getDataRange().getValues();
+  for (var i = mainData.length - 1; i >= 1; i--) {
+    if (String(mainData[i][0]) === String(examId)) {
+      mainSheet.deleteRow(i + 1);
+      break;
+    }
+  }
+
+  // 2-4. Bersihkan sheet turunan yang terkait lewat examId
+  deleteRowsByColumn_(getOrCreateSheet_('Nilai', NILAI_HEADERS), 'examId', examId);
+  deleteRowsByColumn_(getOrCreateSheet_('StatusKelulusan', STATUS_HEADERS), 'examId', examId);
+  deleteRowsByColumn_(getOrCreateSheet_('SuratStatus', SURAT_HEADERS), 'examId', examId);
+
+  return ContentService.createTextOutput(JSON.stringify({ status: 'success' }))
+    .setMimeType(ContentService.MimeType.JSON);
+}
