@@ -4,6 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>e-Sidang Gizi - Jurusan Gizi Poltekkes Kemenkes Makassar</title>
+    <!-- Gizi-Link: login sekali untuk semua aplikasi mahasiswa -->
+    <script src="https://jurusan-gizi.github.io/sso.js"></script>
     <!-- Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
     <!-- FontAwesome Icons -->
@@ -206,6 +208,9 @@ Minimum version required to store current data is: `+i+`.
                     </ol>
                 </div>
             </div>
+
+            <!-- Status login Gizi-Link (diisi otomatis oleh initSsoMahasiswa) -->
+            <div id="ssoBanner" class="hidden rounded-2xl border p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3"></div>
 
             <form id="pengajuanForm" onsubmit="handleFormSubmit(event)" class="bg-white rounded-2xl border border-slate-200 shadow-sm p-6 sm:p-8 space-y-8">
                 
@@ -492,6 +497,10 @@ Minimum version required to store current data is: `+i+`.
                         <i class="fa-solid fa-right-to-bracket"></i>
                         <span>Masuk</span>
                     </button>
+                    <button type="button" onclick="GiziSSO.masuk(location.href.split('#')[0], 'staf')" class="gizilink-staf-btn w-full px-4 py-2.5 bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 font-bold rounded-xl transition-all flex items-center justify-center space-x-2">
+                        <i class="fa-solid fa-link"></i>
+                        <span>Masuk lewat Gizi-Link</span>
+                    </button>
                 </div>
             </div>
 
@@ -562,6 +571,10 @@ Minimum version required to store current data is: `+i+`.
                     <button onclick="handleAdminLogin()" id="btnAdminLogin" class="w-full px-4 py-2.5 bg-rose-600 hover:bg-rose-700 text-white font-bold rounded-xl shadow-md transition-all flex items-center justify-center space-x-2">
                         <i class="fa-solid fa-right-to-bracket"></i>
                         <span>Masuk</span>
+                    </button>
+                    <button type="button" onclick="GiziSSO.masuk(location.href.split('#')[0], 'staf')" class="gizilink-staf-btn w-full px-4 py-2.5 bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 font-bold rounded-xl transition-all flex items-center justify-center space-x-2">
+                        <i class="fa-solid fa-link"></i>
+                        <span>Masuk lewat Gizi-Link</span>
                     </button>
                 </div>
             </div>
@@ -1239,6 +1252,9 @@ Minimum version required to store current data is: `+i+`.
         // data, sehingga server tetap memverifikasi kode akses di setiap aksi hapus,
         // bukan hanya mempercayai status login di browser.
         let currentAdminPin = '';
+        // PIN dosen yang dipakai login manual -- disimpan di memori saja (hilang saat
+        // halaman ditutup) supaya server bisa memeriksa ulang setiap simpan nilai.
+        let currentDosenPin = '';
 
         // Daftar seluruh mahasiswa (NIM tersensor, publik -- dipakai tab "Progres Ujian")
         let mahasiswaDashboard = [];
@@ -1270,7 +1286,150 @@ Minimum version required to store current data is: `+i+`.
             renderTable();
             populateLecturerFilter();
             checkVerifyParam();
+            initSsoMahasiswa();
+            initSsoStaf();
         };
+
+        /* ============================================================
+           GIZI-LINK (LOGIN SEKALI)
+           Kalau mahasiswa sudah masuk di portal Gizi-Link, NIM & nama
+           langsung terisi dan terkunci. Edit/hapus jadwal miliknya juga
+           tidak perlu mengetik NIM lagi. Tanpa Gizi-Link, cara lama tetap jalan.
+           ============================================================ */
+        function getSso() {
+            return (window.GiziSSO && GiziSSO.get()) || null;
+        }
+
+        function mapProdiSso(prodi) {
+            const p = String(prodi || '').toLowerCase();
+            if (!p) return '';
+            if (p.includes('d3') || p.includes('diploma') || p.includes('d-iii') || p.includes('diii')) return 'Prodi D3 Gizi';
+            if (p.includes('profesi')) return 'Prodi Pendidikan Profesi Dietisien';
+            if (p.includes('sarjana') || p.includes('d4') || p.includes('str') || p.includes('dietetika')) return 'Prodi Sarjana Terapan Gizi dan Dietetika';
+            return '';
+        }
+
+        function mapKelasSso(kelas) {
+            const k = String(kelas || '').toUpperCase();
+            if (k.includes('RPL')) return 'Kelas RPL';
+            const m = k.match(/(?:^|[^A-Z])([ABC])(?:[^A-Z]|$)/) || k.match(/^([ABC])$/);
+            return m ? 'Kelas ' + m[1] : '';
+        }
+
+        function initSsoMahasiswa() {
+            const banner = document.getElementById('ssoBanner');
+            if (!banner) return;
+            const sso = getSso();
+            const nimEl = document.getElementById('nim');
+            const namaEl = document.getElementById('nama');
+
+            if (!sso) {
+                banner.className = 'rounded-2xl border border-brand-100 bg-brand-50 p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3';
+                banner.innerHTML = `
+                    <div class="text-sm text-slate-700"><i class="fa-solid fa-right-to-bracket text-brand-600 mr-1.5"></i>
+                        Sudah punya akun <strong>Gizi-Link</strong>? Masuk sekali, NIM & nama terisi otomatis.</div>
+                    <button type="button" onclick="GiziSSO.masuk(location.href.split('#')[0])" class="shrink-0 px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white text-xs font-bold rounded-lg">Masuk lewat Gizi-Link</button>`;
+                if (!window.GiziSSO) banner.className += ' hidden';
+                nimEl.readOnly = false;
+                nimEl.classList.remove('bg-slate-100', 'cursor-not-allowed');
+                return;
+            }
+
+            banner.className = 'rounded-2xl border border-emerald-200 bg-emerald-50 p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3';
+            banner.innerHTML = `
+                <div class="text-sm text-emerald-900"><i class="fa-solid fa-circle-check text-emerald-600 mr-1.5"></i>
+                    Masuk lewat Gizi-Link sebagai <strong></strong></div>
+                <button type="button" onclick="keluarSso()" class="shrink-0 px-3 py-2 bg-white border border-emerald-200 hover:bg-emerald-100 text-emerald-800 text-xs font-semibold rounded-lg">Bukan Anda? Keluar</button>`;
+            banner.querySelector('strong').textContent = `${sso.nama} (${maskNim(sso.nim)})`;
+
+            nimEl.value = sso.nim;
+            nimEl.readOnly = true;
+            nimEl.classList.add('bg-slate-100', 'cursor-not-allowed');
+            namaEl.value = sso.nama || '';
+            nimVerified = true;
+            nimVerifiedValue = sso.nim;
+            setNimStatus('success', 'Terverifikasi lewat Gizi-Link');
+
+            const prodi = mapProdiSso(sso.prodi);
+            const prodiEl = document.getElementById('prodi');
+            if (prodi && !prodiEl.value) { prodiEl.value = prodi; updateJenisUjianOptions(); }
+            const kelas = mapKelasSso(sso.kelas);
+            const kelasEl = document.getElementById('kelas');
+            if (kelas && !kelasEl.value) kelasEl.value = kelas;
+        }
+
+        function keluarSso() {
+            GiziSSO.keluar(false);
+            document.getElementById('nim').value = '';
+            document.getElementById('nama').value = '';
+            nimVerified = false;
+            nimVerifiedValue = '';
+            clearNimStatus();
+            initSsoMahasiswa();
+        }
+
+        /* ---------- Gizi-Link untuk DOSEN & ADMIN ---------- */
+        function getStafSso() {
+            return (window.GiziSSO && GiziSSO.getStaf && GiziSSO.getStaf()) || null;
+        }
+
+        function kredensialAdmin() {
+            const staf = getStafSso();
+            return { pin: currentAdminPin, token: staf ? staf.token : '' };
+        }
+
+        async function initSsoStaf() {
+            const staf = getStafSso();
+            document.querySelectorAll('.gizilink-staf-btn').forEach(b => b.classList.toggle('hidden', !window.GiziSSO || !!staf));
+            if (!staf) return;
+
+            // Dosen (atau admin yang juga dosen): langsung ke daftar tugas penilaian
+            if (staf.esidang === 'dosen' || staf.esidang === 'admin') {
+                const dosen = DosenList.find(d => d.name.replace(/\s+/g, ' ').trim().toLowerCase() === String(staf.nama).replace(/\s+/g, ' ').trim().toLowerCase());
+                if (dosen) {
+                    currentDosen = dosen.name;
+                    document.getElementById('dosenActiveName').innerText = dosen.name;
+                    document.getElementById('dosenLoginCard').classList.add('hidden');
+                    document.getElementById('dosenTaskArea').classList.remove('hidden');
+                    renderDosenTasks();
+                }
+            }
+
+            // Admin: langsung buka Berita Acara tanpa kode akses
+            if (staf.esidang === 'admin' && GOOGLE_SHEETS_URL) {
+                try {
+                    const res = await fetch(GOOGLE_SHEETS_URL, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+                        body: JSON.stringify({ action: 'getAdminData', token: staf.token })
+                    });
+                    const data = await res.json();
+                    if (data && data.valid === true) {
+                        adminAuthenticated = true;
+                        adminSubmissions = normalizeSubmissions(data.submissions || []);
+                        document.getElementById('adminLoginCard').classList.add('hidden');
+                        document.getElementById('adminRekapArea').classList.remove('hidden');
+                        renderRekapList();
+                    }
+                } catch (e) {
+                    console.log("Gagal masuk admin otomatis:", e);
+                }
+            }
+        }
+
+        // Kirim ke server dan BACA jawabannya (text/plain = tanpa preflight CORS).
+        async function kirimKeServer(body) {
+            const res = await fetch(GOOGLE_SHEETS_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+                body: JSON.stringify(body)
+            });
+            const data = await res.json();
+            if (!data || data.status !== 'success') {
+                throw new Error((data && data.message) || 'Server menolak permintaan.');
+            }
+            return data;
+        }
 
         /* ============================================================
            OVERLAY VERIFIKASI QR (client-side, tidak bergantung ke halaman
@@ -1456,46 +1615,20 @@ Minimum version required to store current data is: `+i+`.
         // Save New Submission to Google Sheets
         async function syncCreateToSheets(newSub) {
             if (!GOOGLE_SHEETS_URL) return;
-            try {
-                await fetch(GOOGLE_SHEETS_URL, {
-                    method: 'POST',
-                    mode: 'no-cors',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ action: 'create', data: newSub })
-                });
-            } catch (e) {
-                console.error("Sheets Sync Error", e);
-            }
+            const sso = getSso();
+            await kirimKeServer({ action: 'create', data: newSub, token: sso ? sso.token : '' });
         }
 
         // Update Submission in Google Sheets
-        async function syncUpdateToSheets(sub) {
+        async function syncUpdateToSheets(sub, kredensial) {
             if (!GOOGLE_SHEETS_URL) return;
-            try {
-                await fetch(GOOGLE_SHEETS_URL, {
-                    method: 'POST',
-                    mode: 'no-cors',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ action: 'update', data: sub })
-                });
-            } catch (e) {
-                console.error("Sheets Update Error", e);
-            }
+            await kirimKeServer(Object.assign({ action: 'update', data: sub }, kredensial || {}));
         }
 
         // Delete Submission from Google Sheets
-        async function syncDeleteToSheets(id) {
+        async function syncDeleteToSheets(id, kredensial) {
             if (!GOOGLE_SHEETS_URL) return;
-            try {
-                await fetch(GOOGLE_SHEETS_URL, {
-                    method: 'POST',
-                    mode: 'no-cors',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ action: 'delete', id: id })
-                });
-            } catch (e) {
-                console.error("Sheets Delete Error", e);
-            }
+            await kirimKeServer(Object.assign({ action: 'delete', id: id }, kredensial || {}));
         }
 
         // Verifikasi NIM ke server -- NIM asli tidak pernah dikirim balik ke browser,
@@ -1810,7 +1943,7 @@ Minimum version required to store current data is: `+i+`.
         }
 
         // Form Submission Handler
-        function handleFormSubmit(e) {
+        async function handleFormSubmit(e) {
             e.preventDefault();
 
             const nama = document.getElementById('nama').value.trim();
@@ -1872,10 +2005,23 @@ Minimum version required to store current data is: `+i+`.
                 timestamp: new Date().toLocaleString('id-ID')
             };
 
-            submissions.unshift(newSubmission);
+            const btnSubmit = document.getElementById('btnSubmit');
+            const btnSubmitHtml = btnSubmit.innerHTML;
+            btnSubmit.disabled = true;
+            btnSubmit.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> <span>Mengirim...</span>';
+            try {
+                await syncCreateToSheets(newSubmission);
+            } catch (err) {
+                showModal("Gagal Mengajukan", "Tidak Tersimpan", (err && err.message) || "Server tidak merespons. Periksa koneksi lalu coba lagi.", "error");
+                return;
+            } finally {
+                btnSubmit.disabled = false;
+                btnSubmit.innerHTML = btnSubmitHtml;
+            }
+
+            submissions.unshift(Object.assign({}, newSubmission, { nim: maskNim(newSubmission.nim) }));
             renderTable();
             renderLecturerSchedule();
-            syncCreateToSheets(newSubmission);
 
             showModal(
                 "Pengajuan Berhasil!",
@@ -1899,6 +2045,7 @@ Minimum version required to store current data is: `+i+`.
             nimVerified = false;
             nimVerifiedValue = '';
             clearNimStatus();
+            initSsoMahasiswa();
         }
 
         // Render Table Data
@@ -1989,10 +2136,24 @@ Minimum version required to store current data is: `+i+`.
         /* --- VERIFICATION & EDIT MODAL SYSTEM --- */
         let targetSubId = null;
         let pendingAction = null; // 'edit' or 'delete'
+        let kredensialUbah = null; // { token } atau { nim } -- dikirim ke server sebagai bukti pemilik
 
         function requestVerification(id, action) {
             targetSubId = id;
             pendingAction = action;
+            kredensialUbah = null;
+
+            // Login lewat Gizi-Link & data ini miliknya -> tidak perlu ketik NIM
+            const sso = getSso();
+            const sub = submissions.find(s => s.id === id);
+            if (sso && sub && maskNim(sso.nim) === String(sub.nim)) {
+                kredensialUbah = { token: sso.token };
+                targetSubId = null;
+                pendingAction = null;
+                if (action === 'delete') deleteSubmission(id);
+                else openEditModal(id);
+                return;
+            }
 
             document.getElementById('verifyNimInput').value = '';
             document.getElementById('verifyError').classList.add('hidden');
@@ -2034,6 +2195,7 @@ Minimum version required to store current data is: `+i+`.
             }
 
             // NIM terverifikasi oleh server! Lanjutkan aksi
+            kredensialUbah = { nim: inputNim };
             const action = pendingAction;
             const currentId = targetSubId;
             closeVerifyModal();
@@ -2071,7 +2233,7 @@ Minimum version required to store current data is: `+i+`.
             document.getElementById('editModal').classList.add('hidden');
         }
 
-        function handleEditSubmit(e) {
+        async function handleEditSubmit(e) {
             e.preventDefault();
 
             const id = Number(document.getElementById('editId').value);
@@ -2125,10 +2287,16 @@ Minimum version required to store current data is: `+i+`.
                     tanggal, slotWaktu, ruangan
                 };
 
+                try {
+                    await syncUpdateToSheets(updatedSub, kredensialUbah);
+                } catch (err) {
+                    showModal("Gagal Mengubah", "Tidak Tersimpan", (err && err.message) || "Server tidak merespons. Coba lagi.", "error");
+                    return;
+                }
+
                 submissions[index] = updatedSub;
                 renderTable();
                 renderLecturerSchedule();
-                syncUpdateToSheets(updatedSub);
 
                 closeEditModal();
                 showModal("Berhasil Diperbarui!", "Jadwal Diubah", `Jadwal pengajuan ujian untuk <strong>${nama}</strong> (${nim}) telah berhasil diperbarui.`, "success");
@@ -2205,11 +2373,16 @@ Minimum version required to store current data is: `+i+`.
         }
 
         // Delete Submission
-        function deleteSubmission(id) {
+        async function deleteSubmission(id) {
+            try {
+                await syncDeleteToSheets(id, kredensialUbah);
+            } catch (err) {
+                showModal("Gagal Menghapus", "Tidak Terhapus", (err && err.message) || "Server tidak merespons. Coba lagi.", "error");
+                return;
+            }
             submissions = submissions.filter(s => s.id !== id);
             renderTable();
             renderLecturerSchedule();
-            syncDeleteToSheets(id);
             showModal("Terhapus", "Jadwal Dihapus", "Data pengajuan ujian telah berhasil dihapus dari sistem.", "info");
         }
 
@@ -2612,6 +2785,7 @@ Minimum version required to store current data is: `+i+`.
             }
 
             currentDosen = name;
+            currentDosenPin = pin;
             document.getElementById('dosenActiveName').innerText = name;
             document.getElementById('dosenLoginCard').classList.add('hidden');
             document.getElementById('dosenTaskArea').classList.remove('hidden');
@@ -2620,7 +2794,9 @@ Minimum version required to store current data is: `+i+`.
         }
 
         function handleDosenLogout() {
+            if (getStafSso()) GiziSSO.keluar(false);
             currentDosen = null;
+            currentDosenPin = '';
             document.getElementById('dosenTaskArea').classList.add('hidden');
             document.getElementById('dosenLoginCard').classList.remove('hidden');
         }
@@ -2896,19 +3072,11 @@ Minimum version required to store current data is: `+i+`.
         // Simpan nilai ke Google Sheets (mode no-cors, sama seperti create/update submission)
         async function saveNilaiToSheets(payload) {
             if (!GOOGLE_SHEETS_URL) return;
-            try {
-                await fetch(GOOGLE_SHEETS_URL, {
-                    method: 'POST',
-                    mode: 'no-cors',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ action: 'saveNilai', data: payload })
-                });
-            } catch (e) {
-                console.error("Gagal menyimpan nilai ke Sheets:", e);
-            }
+            const staf = getStafSso();
+            await kirimKeServer({ action: 'saveNilai', data: payload, pin: currentDosenPin, token: staf ? staf.token : '' });
         }
 
-        function submitNilai() {
+        async function submitNilai() {
             if (!currentNilaiContext) return;
             const sub = submissions.find(s => String(s.id) === String(currentNilaiContext.examId));
             if (!sub) return;
@@ -2966,9 +3134,14 @@ Minimum version required to store current data is: `+i+`.
                 payload.skorAkhirUAP = Number(resultUAP.skorAkhirUAP.toFixed(2));
             }
 
-            saveNilaiToSheets(payload);
+            try {
+                await saveNilaiToSheets(payload);
+            } catch (err) {
+                showModal("Nilai Belum Tersimpan", "Gagal Menyimpan", (err && err.message) || "Server tidak merespons. Coba lagi.", "error");
+                return;
+            }
 
-            // Update cache lokal secara optimis supaya UI langsung ter-update
+            // Update cache lokal supaya UI langsung ter-update
             const nilaiId = String(payload.examId) + '_' + payload.role;
             const idx = nilaiRecords.findIndex(n => n.id === nilaiId);
             const record = {
@@ -3051,6 +3224,7 @@ Minimum version required to store current data is: `+i+`.
         }
 
         function handleAdminLogout() {
+            if (getStafSso()) GiziSSO.keluar(false);
             adminAuthenticated = false;
             adminSubmissions = [];
             currentAdminPin = '';
@@ -3063,14 +3237,10 @@ Minimum version required to store current data is: `+i+`.
         // otomatis setelah admin berhasil unduh PDF surat.
         async function setSuratStatus(examId, newStatus) {
             try {
-                await fetch(GOOGLE_SHEETS_URL, {
-                    method: 'POST',
-                    mode: 'no-cors',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ action: 'markSuratStatus', examId: examId, status: newStatus })
-                });
+                await kirimKeServer(Object.assign({ action: 'markSuratStatus', examId: examId, status: newStatus }, kredensialAdmin()));
             } catch (e) {
-                console.error("Gagal menyimpan status surat:", e);
+                showModal("Gagal Menyimpan", "Status Surat", (e && e.message) || "Server tidak merespons.", "error");
+                return;
             }
 
             const idx = suratStatusRecords.findIndex(s => String(s.examId) === String(examId));
@@ -3185,7 +3355,7 @@ Minimum version required to store current data is: `+i+`.
                 const res = await fetch(GOOGLE_SHEETS_URL, {
                     method: 'POST',
                     headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-                    body: JSON.stringify({ action: 'deleteExamData', pin: currentAdminPin, examId: sub.id })
+                    body: JSON.stringify(Object.assign({ action: 'deleteExamData', examId: sub.id }, kredensialAdmin()))
                 });
                 const data = await res.json();
 
@@ -3546,21 +3716,17 @@ Minimum version required to store current data is: `+i+`.
             const kaprodiJabatan = document.getElementById('kaprodiNamaInput').dataset.jabatan || 'Kaprodi';
 
             try {
-                await fetch(GOOGLE_SHEETS_URL, {
-                    method: 'POST',
-                    mode: 'no-cors',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        action: 'setStatusKelulusan',
-                        examId: currentBeritaExamId,
-                        status: status,
-                        kaprodiNama: kaprodiNama,
-                        kaprodiNip: kaprodiNip,
-                        kaprodiJabatan: kaprodiJabatan
-                    })
-                });
+                await kirimKeServer(Object.assign({
+                    action: 'setStatusKelulusan',
+                    examId: currentBeritaExamId,
+                    status: status,
+                    kaprodiNama: kaprodiNama,
+                    kaprodiNip: kaprodiNip,
+                    kaprodiJabatan: kaprodiJabatan
+                }, kredensialAdmin()));
             } catch (e) {
-                console.error("Gagal menyimpan status/persetujuan kaprodi:", e);
+                showModal("Gagal Menyimpan", "Status Kelulusan", (e && e.message) || "Server tidak merespons.", "error");
+                throw e;
             }
 
             const idx = statusRecords.findIndex(s => String(s.examId) === String(currentBeritaExamId));
